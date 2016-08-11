@@ -1,11 +1,15 @@
 package scredis
 
+import akka.actor._
 import com.typesafe.config.Config
 import scredis.commands._
 import scredis.io.{ClusterConnection, Connection}
+import scredis.protocol.requests.ConnectionRequests.Quit
+import scredis.util.UniqueNameGenerator
 
-import scala.concurrent.ExecutionContext
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration._
+import scala.language.postfixOps
 
 /**
   * Defines a `RedisCluster` [[scredis.Client]] supporting all non-blocking commands that can be addressed to either
@@ -16,6 +20,7 @@ import scala.concurrent.duration.FiniteDuration
   * @define typesafeConfig com.typesafe.Config
   */
 class RedisCluster private[scredis](
+    systemOrName: Either[ActorSystem, String],
     nodes: Seq[Server] = RedisConfigDefaults.Redis.ClusterNodes,
     maxRetries: Int = 4,
     receiveTimeoutOpt: Option[FiniteDuration] = RedisConfigDefaults.IO.ReceiveTimeoutOpt,
@@ -35,7 +40,8 @@ class RedisCluster private[scredis](
     receiveTimeoutOpt = receiveTimeoutOpt,
     connectTimeout = connectTimeout,
     maxWriteBatchSize = maxWriteBatchSize,
-    tcpSendBufferSizeHint = tcpReceiveBufferSizeHint,
+    tcpSendBufferSizeHint = tcpSendBufferSizeHint,
+    tcpReceiveBufferSizeHint = tcpReceiveBufferSizeHint,
     akkaListenerDispatcherPath = akkaListenerDispatcherPath,
     akkaIODispatcherPath = akkaIODispatcherPath,
     tryAgainWait = tryAgainWait,
@@ -52,9 +58,18 @@ class RedisCluster private[scredis](
   with SortedSetCommands
   with StringCommands
   //with SubscriberCommands
+  with TransactionCommands
 {
   override implicit val dispatcher: ExecutionContext =
     ExecutionContext.Implicits.global // TODO perhaps implement our own
+
+  private var shouldShutdownSubscriberClient = false
+  private var shouldShutdownBlockingClient = false
+
+  private val system = systemOrName match {
+    case Left(system) => system
+    case Right(name) => ActorSystem(UniqueNameGenerator.getUniqueName(name))
+  }
 
   /**
     * Constructs a $redisCluster instance from a [[scredis.RedisConfig]].
@@ -62,6 +77,7 @@ class RedisCluster private[scredis](
     * @return the constructed $redisCluster
     */
   def this(config: RedisConfig) = this(
+    systemOrName = Right(config.IO.Akka.ActorSystemName),
     nodes = config.Redis.ClusterNodes,
     maxRetries = 4,
     receiveTimeoutOpt = config.IO.ReceiveTimeoutOpt,
@@ -82,6 +98,76 @@ class RedisCluster private[scredis](
     * @return the constructed $redisCluster
     */
   def this() = this(RedisConfig())
+
+  /**
+    * Lazily initialized [[scredis.BlockingClient]].
+    */
+  lazy val blocking = {
+    shouldShutdownBlockingClient = true
+    ClusterBlockingClient(
+      nodes = nodes,
+      maxRetries = maxRetries,
+      connectTimeout = connectTimeout,
+      maxWriteBatchSize = maxWriteBatchSize,
+      tcpSendBufferSizeHint = tcpSendBufferSizeHint,
+      tcpReceiveBufferSizeHint = tcpReceiveBufferSizeHint,
+      akkaListenerDispatcherPath = akkaListenerDispatcherPath,
+      akkaIODispatcherPath = akkaIODispatcherPath,
+      akkaDecoderDispatcherPath = akkaDecoderDispatcherPath,
+      tryAgainWait = tryAgainWait,
+      clusterDownWait = clusterDownWait
+    )(system)
+  }
+
+  /**
+    * Lazily initialized [[scredis.SubscriberClient]].
+    */
+  lazy val subscriber = {
+    shouldShutdownSubscriberClient = true
+    val server = connections.head._1
+    SubscriberClient(
+      host = server.host,
+      port = server.port,
+      connectTimeout = connectTimeout,
+      receiveTimeoutOpt = receiveTimeoutOpt,
+      maxWriteBatchSize = maxWriteBatchSize,
+      tcpSendBufferSizeHint = tcpSendBufferSizeHint,
+      tcpReceiveBufferSizeHint = tcpReceiveBufferSizeHint,
+      akkaListenerDispatcherPath = akkaListenerDispatcherPath,
+      akkaIODispatcherPath = akkaIODispatcherPath,
+      akkaDecoderDispatcherPath = akkaDecoderDispatcherPath
+    )(system)
+  }
+
+  /**
+    * Closes the connection.
+    */
+  def quit(): Future[Unit] = {
+    if (shouldShutdownBlockingClient) {
+      try {
+        blocking.quit()(5 seconds)
+      } catch {
+        case e: Throwable => logger.error("Could not shutdown blocking client", e)
+      }
+    }
+    val future = if (shouldShutdownSubscriberClient) {
+      subscriber.quit().map { _ =>
+        subscriber.awaitTermination(3 seconds)
+      }
+    } else {
+      Future.successful(())
+    }
+    future.recover {
+      case e: Throwable => logger.error("Could not shutdown subscriber client", e)
+    }.flatMap { _ =>
+      send(Quit())
+    }.map { _ =>
+      systemOrName match {
+        case Left(system) => // Do not shutdown provided ActorSystem
+        case Right(name) => system.terminate()
+      }
+    }
+  }
 
 }
 
@@ -113,12 +199,14 @@ object RedisCluster {
     maxWriteBatchSize: Int = RedisConfigDefaults.IO.MaxWriteBatchSize,
     tcpSendBufferSizeHint: Int = RedisConfigDefaults.IO.TCPSendBufferSizeHint,
     tcpReceiveBufferSizeHint: Int = RedisConfigDefaults.IO.TCPReceiveBufferSizeHint,
+    actorSystemName: String = RedisConfigDefaults.IO.Akka.ActorSystemName,
     akkaListenerDispatcherPath: String = RedisConfigDefaults.IO.Akka.ListenerDispatcherPath,
     akkaIODispatcherPath: String = RedisConfigDefaults.IO.Akka.IODispatcherPath,
     akkaDecoderDispatcherPath: String = RedisConfigDefaults.IO.Akka.DecoderDispatcherPath,
     tryAgainWait: FiniteDuration = RedisConfigDefaults.IO.Cluster.TryAgainWait,
     clusterDownWait: FiniteDuration = RedisConfigDefaults.IO.Cluster.ClusterDownWait
   ) = new RedisCluster(
+    systemOrName = Right(actorSystemName),
     nodes = nodes,
     maxRetries = maxRetries,
     receiveTimeoutOpt = receiveTimeoutOpt,

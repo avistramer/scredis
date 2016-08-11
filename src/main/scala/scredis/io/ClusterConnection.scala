@@ -6,11 +6,12 @@ import scredis.exceptions._
 import scredis.protocol._
 import scredis.protocol.requests.ClusterRequests.{ClusterCountKeysInSlot, ClusterInfo, ClusterSlots}
 import scredis.util.UniqueNameGenerator
-import scredis.{ClusterSlotRange, RedisConfigDefaults, Server}
+import scredis.{ClusterSlotRange, RedisConfigDefaults, Server, Transaction}
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.concurrent.{Await, Future, Promise}
+import scala.util.Try
 
 /**
  * The connection logic for a whole Redis cluster. Handles redirection and sharding logic as specified in
@@ -33,7 +34,7 @@ abstract class ClusterConnection(
     akkaDecoderDispatcherPath: String = RedisConfigDefaults.IO.Akka.DecoderDispatcherPath,
     tryAgainWait: FiniteDuration = RedisConfigDefaults.IO.Cluster.TryAgainWait,
     clusterDownWait: FiniteDuration = RedisConfigDefaults.IO.Cluster.ClusterDownWait
-  ) extends NonBlockingConnection with LazyLogging {
+  ) extends NonBlockingConnection with TransactionEnabledConnection with LazyLogging {
 
   private val maxHashMisses = 100
   private val maxConnectionMisses = 3
@@ -43,7 +44,7 @@ abstract class ClusterConnection(
   /** Set of active cluster node connections. Initialized from `nodes` parameter. */
   // TODO it may be more efficient to save the connections in hashSlots directly
   // TODO we need some information about node health for updates
-  private[scredis] var connections: Map[Server, (NonBlockingConnection, Int)] = initialConnections
+  private[scredis] var connections: Map[Server, (AkkaNonBlockingConnection, Int)] = initialConnections
 
   // TODO keep master-slave associations to be able to ask slaves for data with appropriate config
 
@@ -59,7 +60,7 @@ abstract class ClusterConnection(
   Await.ready(updateCache(maxRetries), connectTimeout)
 
   /** Set up initial connections from configuration. */
-  private def initialConnections: Map[Server, (NonBlockingConnection, Int)] =
+  private def initialConnections: Map[Server, (AkkaNonBlockingConnection, Int)] =
     nodes.map { server => (server, (makeConnection(server), 0))}.toMap
 
 
@@ -107,7 +108,7 @@ abstract class ClusterConnection(
   }
 
   /** Creates a new connection to a server. */
-  private def makeConnection(server: Server): NonBlockingConnection = {
+  private def makeConnection(server: Server): AkkaNonBlockingConnection = {
     val systemName = RedisConfigDefaults.IO.Akka.ActorSystemName
     val system = ActorSystem(UniqueNameGenerator.getUniqueName(systemName))
 
@@ -194,6 +195,71 @@ abstract class ClusterConnection(
     }
   }
 
+  /**
+    * Send a Redis transaction object and handle cluster specific error cases
+    * @param transaction transaction object
+    * @param server server to contact
+    * @param retry remaining retries
+    * @param remainingTimeout how much longer to retry an action, rather than number of retries
+    * @tparam A response type
+    * @return
+    */
+  private def sendTx(transaction: Transaction, server: Server,
+                     triedServers: Set[Server] = Set.empty,
+                     retry: Int = maxRetries, remainingTimeout: Duration = connectTimeout,
+                     error: Option[RedisException] = None): Future[Vector[Try[Any]]] = {
+    if (retry <= 0) Future.failed(RedisIOException(s"Gave up on transaction after $maxRetries retries: $transaction", error.orNull))
+    else {
+      val (connection,_) = connections.getOrElse(server, {
+        val con = makeConnection(server)
+        connections = this.synchronized {
+          connections.updated(server, (con,0))
+        }
+        (con,0)
+      })
+
+      // handle cases that should be retried (MOVE, ASK, TRYAGAIN)
+      connection.send(transaction).recoverWith {
+
+        case err @ RedisClusterErrorResponseException(Moved(slot, host, port), _) =>
+          transaction.requests.map { _.reset() }
+          // this will usually happen when cache is missed.
+          val movedServer: Server = Server(host, port)
+          updateHashMisses(slot, movedServer)
+
+          sendTx(transaction, movedServer, triedServers+server, retry - 1, remainingTimeout, Option(err))
+
+        case err @ RedisClusterErrorResponseException(Ask(hashSlot, host, port), _) =>
+          transaction.requests.map { _.reset() }
+          val askServer = Server(host,port)
+          sendTx(transaction, askServer, triedServers+server, retry - 1, remainingTimeout, Option(err))
+
+        case err @ RedisClusterErrorResponseException(TryAgain, _) =>
+          transaction.requests.map { _.reset() }
+          // TODO what is actually the intended semantics of TryAgain?
+          delayed(tryAgainWait) { sendTx(transaction, server, triedServers+server, retry - 1, remainingTimeout - tryAgainWait, Option(err)) }
+
+        case err @ RedisClusterErrorResponseException(ClusterDown, _) =>
+          transaction.requests.map { _.reset() }
+          logger.debug(s"Received CLUSTERDOWN error from transaction $transaction. Retrying ...")
+          val nextTimeout = remainingTimeout - clusterDownWait
+          if (nextTimeout <= 0.millis) Future.failed(RedisIOException(s"Aborted transaction $transaction after trying for ${connectTimeout}", err))
+          else delayed(clusterDownWait) { sendTx(transaction, server, triedServers, retry, nextTimeout, Option(err)) }
+        // wait a bit because the cluster may not be fully initialized or fixing itself
+
+        case err @ RedisIOException(message, cause) =>
+          transaction.requests.map { _.reset() }
+          updateServerErrors(server)
+          val nextTriedServers = triedServers + server
+          // try any server that isn't one we tried already
+          connections.keys.find { s => !nextTriedServers.contains(s)  } match {
+            case Some(nextServer) => sendTx(transaction, nextServer, nextTriedServers, retry - 1, remainingTimeout, Option(err))
+            case None => Future.failed(RedisIOException("No valid connection available.", err))
+          }
+      }
+    }
+  }
+
   private def updateHashMisses(slot: Int, newServer: Server) = this.synchronized {
     // I believe it is safe to synchronize only updates to hashSlots.
     // If another concurrent read is outdated it will be redirected anyway and potentially repeat the update.
@@ -260,6 +326,25 @@ abstract class ClusterConnection(
         // but arbitrary choice is probably not what's intended..
         Future.failed(RedisInvalidArgumentException("This command is not supported for clusters"))
     }
+
+  override protected[scredis] def send(transaction: Transaction): Future[Vector[Try[Any]]] = {
+    if (transaction.requests.length > 0) {
+      transaction.requests.find { r =>
+        r match {
+          case keyReq: Request[_] with Key => true
+          case _ => false
+        }
+      }.flatMap { r =>
+        hashSlots(ClusterCRC16.getSlot(r.asInstanceOf[Request[_] with Key].key))
+      } match {
+        case None =>
+          if (connections.isEmpty) Future.failed(RedisIOException("No cluster node connection available"))
+          else sendTx(transaction, connections.head._1) // when we can't get a cached server, just get the first connection
+        case Some(server) =>
+          sendTx(transaction, server)
+      }
+    } else Future.failed(RedisIOException("Empty transaction"))
+  }
 
   // TODO at init: fetch all hash slot-node associations: CLUSTER SLOTS
 }
