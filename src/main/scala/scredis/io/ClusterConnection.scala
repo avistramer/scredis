@@ -5,7 +5,6 @@ import com.typesafe.scalalogging.LazyLogging
 import scredis.exceptions._
 import scredis.protocol._
 import scredis.protocol.requests.ClusterRequests.{ClusterCountKeysInSlot, ClusterInfo, ClusterSlots}
-import scredis.util.UniqueNameGenerator
 import scredis.{ClusterSlotRange, RedisConfigDefaults, Server, Transaction}
 
 import scala.concurrent.ExecutionContext.Implicits.global
@@ -22,6 +21,7 @@ import scala.util.Try
  *                   several nodes before giving up on sending a command.
  */
 abstract class ClusterConnection(
+    protected val system: ActorSystem,
     nodes: Seq[Server],
     maxRetries: Int = 4,
     receiveTimeoutOpt: Option[FiniteDuration] = RedisConfigDefaults.IO.ReceiveTimeoutOpt,
@@ -39,7 +39,7 @@ abstract class ClusterConnection(
   private val maxHashMisses = 100
   private val maxConnectionMisses = 3
 
-  private val scheduler = ActorSystem().scheduler
+  private val scheduler = system.scheduler
 
   /** Set of active cluster node connections. Initialized from `nodes` parameter. */
   // TODO it may be more efficient to save the connections in hashSlots directly
@@ -109,9 +109,6 @@ abstract class ClusterConnection(
 
   /** Creates a new connection to a server. */
   private def makeConnection(server: Server): AkkaNonBlockingConnection = {
-    val systemName = RedisConfigDefaults.IO.Akka.ActorSystemName
-    val system = ActorSystem(UniqueNameGenerator.getUniqueName(systemName))
-
     new AkkaNonBlockingConnection(
       system = system, host = server.host, port = server.port, passwordOpt = None,
       database = 0, nameOpt = None, decodersCount = 2,
@@ -201,7 +198,6 @@ abstract class ClusterConnection(
     * @param server server to contact
     * @param retry remaining retries
     * @param remainingTimeout how much longer to retry an action, rather than number of retries
-    * @tparam A response type
     * @return
     */
   private def sendTx(transaction: Transaction, server: Server,

@@ -28,6 +28,7 @@ class ClusterBlockingConnection(
   clusterDownWait: FiniteDuration = RedisConfigDefaults.IO.Cluster.ClusterDownWait
 )
 extends ClusterConnection(
+  system = system,
   nodes = nodes,
   maxRetries = maxRetries,
   receiveTimeoutOpt = receiveTimeoutOpt,

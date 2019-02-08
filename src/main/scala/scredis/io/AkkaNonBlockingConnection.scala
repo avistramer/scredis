@@ -1,7 +1,5 @@
 package scredis.io
 
-import java.util.concurrent.locks.ReentrantReadWriteLock
-
 import akka.actor._
 import scredis.Transaction
 import scredis.exceptions._
@@ -48,8 +46,6 @@ abstract class AkkaNonBlockingConnection(
   akkaIODispatcherPath = akkaIODispatcherPath,
   akkaDecoderDispatcherPath = akkaDecoderDispatcherPath
 ) with NonBlockingConnection with TransactionEnabledConnection {
-  
-  private val lock = new ReentrantReadWriteLock()
   
   protected implicit val listenerActor = system.actorOf(
     Props(

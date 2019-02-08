@@ -35,6 +35,10 @@ class RedisCluster private[scredis](
     clusterDownWait: FiniteDuration = RedisConfigDefaults.IO.Cluster.ClusterDownWait
   )
   extends ClusterConnection(
+    system = systemOrName match {
+      case Left(system) => system
+      case Right(name) => ActorSystem(UniqueNameGenerator.getUniqueName(name))
+    },
     nodes = nodes,
     maxRetries = maxRetries,
     receiveTimeoutOpt = receiveTimeoutOpt,
@@ -65,11 +69,6 @@ class RedisCluster private[scredis](
 
   private var shouldShutdownSubscriberClient = false
   private var shouldShutdownBlockingClient = false
-
-  private val system = systemOrName match {
-    case Left(system) => system
-    case Right(name) => ActorSystem(UniqueNameGenerator.getUniqueName(name))
-  }
 
   /**
     * Constructs a $redisCluster instance from a [[scredis.RedisConfig]].
@@ -269,5 +268,23 @@ object RedisCluster {
     * @return the constructed $redis
     */
   def apply(configName: String, path: String): RedisCluster = new RedisCluster(RedisConfig(configName, path))
+
+  def withActorSystem(config: Config)(implicit system: ActorSystem): RedisCluster = withActorSystem(RedisConfig(config))
+
+  def withActorSystem(config: RedisConfig)(implicit system: ActorSystem): RedisCluster = new RedisCluster(
+    systemOrName = Left(system),
+    nodes = config.Redis.ClusterNodes,
+    maxRetries = 4,
+    receiveTimeoutOpt = config.IO.ReceiveTimeoutOpt,
+    connectTimeout = config.IO.ConnectTimeout,
+    maxWriteBatchSize = config.IO.MaxWriteBatchSize,
+    tcpSendBufferSizeHint = config.IO.TCPSendBufferSizeHint,
+    tcpReceiveBufferSizeHint = config.IO.TCPReceiveBufferSizeHint,
+    akkaListenerDispatcherPath = config.IO.Akka.ListenerDispatcherPath,
+    akkaIODispatcherPath = config.IO.Akka.IODispatcherPath,
+    akkaDecoderDispatcherPath = config.IO.Akka.DecoderDispatcherPath,
+    tryAgainWait = config.IO.Cluster.TryAgainWait,
+    clusterDownWait = config.IO.Cluster.ClusterDownWait
+  )
 
 }
