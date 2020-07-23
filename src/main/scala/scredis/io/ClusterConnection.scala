@@ -36,7 +36,7 @@ abstract class ClusterConnection(
     clusterDownWait: FiniteDuration = RedisConfigDefaults.IO.Cluster.ClusterDownWait
   ) extends NonBlockingConnection with TransactionEnabledConnection with LazyLogging {
 
-  private val maxHashMisses = 100
+  private val maxHashMisses = 10
   private val maxConnectionMisses = 3
 
   private val scheduler = system.scheduler
@@ -119,9 +119,9 @@ abstract class ClusterConnection(
   }
 
   /** Delay a Future-returning operation. */
-  private def delayed[A](delay: Duration)(f: => Future[A]): Future[A] = {
+  private def delayed[A](delay: FiniteDuration)(f: => Future[A]): Future[A] = {
     val delayedF = Promise[A]()
-    scheduler.scheduleOnce(clusterDownWait) {
+    scheduler.scheduleOnce(delay) {
       delayedF.tryCompleteWith(f)
     }
     delayedF.future
@@ -324,12 +324,10 @@ abstract class ClusterConnection(
     }
 
   override protected[scredis] def send(transaction: Transaction): Future[Vector[Try[Any]]] = {
-    if (transaction.requests.length > 0) {
-      transaction.requests.find { r =>
-        r match {
-          case keyReq: Request[_] with Key => true
-          case _ => false
-        }
+    if (transaction.requests.nonEmpty) {
+      transaction.requests.find {
+        case keyReq: Request[_] with Key => true
+        case _ => false
       }.flatMap { r =>
         hashSlots(ClusterCRC16.getSlot(r.asInstanceOf[Request[_] with Key].key))
       } match {
